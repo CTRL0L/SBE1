@@ -1,0 +1,35 @@
+name: Inventory Tracker
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"  # Se ejecuta cada 10 minutos
+  workflow_dispatch:
+
+jobs:
+  run-inventory:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v3
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'  # O la versión que requieras
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar script de inventario
+        run: node index.js
+        env:
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          FIREBASE_AUTH_DOMAIN: ${{ secrets.FIREBASE_AUTH_DOMAIN }}
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
+          FIREBASE_SENDER_ID: ${{ secrets.FIREBASE_SENDER_ID }}
+          FIREBASE_APP_ID: ${{ secrets.FIREBASE_APP_ID }}
+          PLAYER_NAME: ${{ secrets.PLAYER_NAME }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
