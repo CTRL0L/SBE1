@@ -5,9 +5,9 @@ const fetch = (...args) =>
   import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 // ======================
-// Configuración inicial
+// Configuración Firebase
 // ======================
-const FIREBASE_CONFIG = {
+const firebaseConfig = {
   apiKey: process.env.FIREBASE_API_KEY,
   authDomain: process.env.FIREBASE_AUTH_DOMAIN,
   projectId: process.env.FIREBASE_PROJECT_ID,
@@ -16,128 +16,142 @@ const FIREBASE_CONFIG = {
   appId: process.env.FIREBASE_APP_ID,
 };
 
-const TELEGRAM_CONFIG = {
-  botToken: process.env.BOT_TOKEN,
-  chatId: process.env.CHAT_ID,
-};
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
 
+// =======================
+// Variables de entorno
+// =======================
 const PLAYER_NAME = process.env.PLAYER_NAME;
+const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.CHAT_ID;
+
+if (!PLAYER_NAME || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+  throw new Error("Faltan variables de entorno requeridas");
+}
+
+// =======================
+// Constantes y Helpers
+// =======================
 const MAX_RETRIES = 3;
 const INITIAL_RETRY_DELAY = 1000; // 1 segundo
 const COLLECTION_NAME = "skyblock_tracker";
 
-// ======================
-// Validación inicial
-// ======================
-function validateEnvironment() {
-  const missingVars = [];
-  if (!PLAYER_NAME) missingVars.push("PLAYER_NAME");
-  if (!TELEGRAM_CONFIG.botToken) missingVars.push("BOT_TOKEN");
-  if (!TELEGRAM_CONFIG.chatId) missingVars.push("CHAT_ID");
-  if (!Object.values(FIREBASE_CONFIG).every(Boolean))
-    missingVars.push("Variables de Firebase");
-
-  if (missingVars.length > 0) {
-    throw new Error(`Variables faltantes: ${missingVars.join(", ")}`);
-  }
-}
-
-// ======================
-// Helpers de Firebase
-// ======================
-async function firebaseOperation(operation, ...args) {
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+/**
+ * Función para realizar fetch con reintentos y backoff exponencial.
+ */
+async function fetchWithRetry(url, options = {}, retries = MAX_RETRIES) {
+  let delay = INITIAL_RETRY_DELAY;
+  for (let i = 0; i < retries; i++) {
     try {
-      return await operation(...args);
+      const response = await fetch(url, options);
+      if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+      return response;
     } catch (error) {
-      console.error(`Intento ${attempt} fallido:`, error.message);
-      if (attempt === MAX_RETRIES) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+      console.warn(
+        `Error en fetch (intento ${i + 1}/${retries}): ${error.message}`
+      );
+      if (i === retries - 1) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay *= 2;
     }
   }
 }
 
+/**
+ * Envía un mensaje a Telegram para notificar errores o actualizaciones.
+ */
+async function sendTelegramMessage(message) {
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const response = await fetchWithRetry(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message,
+        parse_mode: "Markdown",
+      }),
+    });
+    return await response.json();
+  } catch (error) {
+    console.error("Error enviando mensaje a Telegram:", error);
+  }
+}
+
+/**
+ * Funciones para interactuar con Firestore.
+ */
 async function getFirebaseData(documentName) {
-  return firebaseOperation(async () => {
-    const docRef = doc(getFirestore(), COLLECTION_NAME, documentName);
-    const snapshot = await getDoc(docRef);
-    return snapshot.exists() ? snapshot.data() : {};
-  });
+  const docRef = doc(db, COLLECTION_NAME, documentName);
+  const snapshot = await getDoc(docRef);
+  return snapshot.exists() ? snapshot.data() : {};
 }
 
 async function updateFirebaseData(documentName, data) {
-  return firebaseOperation(async () => {
-    const docRef = doc(getFirestore(), COLLECTION_NAME, documentName);
-    await setDoc(docRef, data);
-  });
+  const docRef = doc(db, COLLECTION_NAME, documentName);
+  await setDoc(docRef, data);
 }
 
-// ======================
-// Helpers de Telegram
-// ======================
-async function sendTelegramAlert(message, error = null) {
-  const maxMessageLength = 4000;
-  let errorDetails = "";
-
-  if (error) {
-    errorDetails = `\n\n🚨 Error Details:\n${error.stack || error.message}`;
-    errorDetails = errorDetails.slice(
-      0,
-      maxMessageLength - message.length - 100
-    );
+// =======================
+// Funciones para procesar el inventario
+// =======================
+function processContainer(container) {
+  const itemsMap = new Map();
+  for (const item of Object.values(container)) {
+    if (!item?.id) continue;
+    const key = item.display_name || "Sin nombre";
+    const count = item.Count || 1;
+    itemsMap.set(key, (itemsMap.get(key) || 0) + count);
   }
+  return Object.fromEntries(itemsMap);
+}
 
-  const fullMessage = `${message}${errorDetails}`.slice(0, maxMessageLength);
-
-  try {
-    const response = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_CONFIG.botToken}/sendMessage`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: TELEGRAM_CONFIG.chatId,
-          text: fullMessage,
-          parse_mode: "Markdown",
-          disable_web_page_preview: true,
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      console.error("Error de Telegram:", await response.text());
+function processStorage(storage) {
+  const itemsMap = new Map();
+  for (const unit of Object.values(storage)) {
+    if (!unit?.containsItems) continue;
+    for (const item of Object.values(unit.containsItems)) {
+      if (!item?.id) continue;
+      const key = item.display_name || "Sin nombre";
+      const count = item.Count || 1;
+      itemsMap.set(key, (itemsMap.get(key) || 0) + count);
     }
-  } catch (error) {
-    console.error("Error enviando alerta:", error);
   }
+  return Object.fromEntries(itemsMap);
 }
 
-// ======================
-// Lógica principal
-// ======================
+/**
+ * Obtiene el inventario del jugador desde la API.
+ */
 async function getPlayerInventory() {
   try {
-    const response = await fetch(
-      `https://sky.shiiyu.moe/api/v2/profile/${PLAYER_NAME}`
-    );
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
+    const url = `https://sky.shiiyu.moe/api/v2/profile/${PLAYER_NAME}`;
+    const response = await fetchWithRetry(url);
     const data = await response.json();
-    if (!data?.profiles) throw new Error("Estructura de datos inválida");
 
-    const currentProfile = Object.values(data.profiles).find((p) => p.current);
-    if (!currentProfile?.data?.items) throw new Error("Perfil no encontrado");
+    if (!data.profiles || typeof data.profiles !== "object") {
+      throw new Error("Respuesta inválida de la API");
+    }
 
-    // Procesamiento de items (similar al anterior pero con más validaciones)
-    // ... (mantener tu lógica de processContainer y processStorage)
-
-    return processedData;
-  } catch (error) {
-    await sendTelegramAlert(
-      `❌ Fallo al obtener inventario de ${PLAYER_NAME}`,
-      error
+    const currentProfile = Object.values(data.profiles).find(
+      (profile) => profile.current === true
     );
-    throw error;
+    if (!currentProfile?.data?.items) {
+      throw new Error("Datos del perfil no encontrados");
+    }
+
+    return {
+      inventory: processContainer(currentProfile.data.items.inventory),
+      enderchest: processContainer(currentProfile.data.items.enderchest),
+      storage: processStorage(currentProfile.data.items.storage),
+    };
+  } catch (error) {
+    console.error("Error obteniendo inventario:", error);
+    await sendTelegramMessage(
+      `🚨 Error obteniendo inventario: ${error.message}`
+    );
+    return null;
   }
 }
 
@@ -147,56 +161,104 @@ async function getPlayerInventory() {
 async function checkInventoryChanges() {
   try {
     const inventoryData = await getPlayerInventory();
+    if (!inventoryData) return;
+
+    const currentInventory = {
+      ...inventoryData.inventory,
+      ...inventoryData.enderchest,
+      ...inventoryData.storage,
+    };
+
     const [prevInventory, investmentRecord] = await Promise.all([
       getFirebaseData("prev_inventory"),
       getFirebaseData("investment_record"),
     ]);
 
-    // Lógica de comparación y detección de cambios
-    // ... (similar al anterior pero con más validaciones)
+    let hasChanges = false;
+    const newInvestmentRecord = { ...investmentRecord };
 
-    if (changesDetected) {
-      await sendTelegramAlert(
-        `✅ Cambios detectados en ${PLAYER_NAME}:\n${changeSummary}`
-      );
+    // Procesar cambios: inversiones y ventas
+    for (const [itemName, currentCount] of Object.entries(currentInventory)) {
+      const prevCount = prevInventory[itemName] || 0;
+      const diff = currentCount - prevCount;
+
+      if (diff > 0) {
+        newInvestmentRecord[itemName] =
+          (newInvestmentRecord[itemName] || 0) + diff;
+        hasChanges = true;
+      } else if (diff < 0) {
+        const invested = newInvestmentRecord[itemName] || 0;
+        const sold = Math.min(Math.abs(diff), invested);
+        if (sold > 0) {
+          newInvestmentRecord[itemName] -= sold;
+          hasChanges = true;
+        }
+      }
     }
 
+    // Eliminar items que ya no existen
+    for (const itemName in newInvestmentRecord) {
+      if (
+        !(itemName in currentInventory) &&
+        newInvestmentRecord[itemName] > 0
+      ) {
+        delete newInvestmentRecord[itemName];
+        hasChanges = true;
+      }
+    }
+
+    if (hasChanges) {
+      let message = `📊 Actualización de ${PLAYER_NAME}:\n`;
+      const changes = Object.entries(currentInventory)
+        .filter(([name, count]) => (prevInventory[name] || 0) !== count)
+        .map(
+          ([name, count]) => `${name}: ${prevInventory[name] || 0} → ${count}`
+        );
+      if (changes.length > 0) {
+        message += "\n🔔 Cambios:\n" + changes.join("\n");
+      }
+      await sendTelegramMessage(message);
+    }
+
+    // Actualizar datos en Firebase
     await Promise.all([
       updateFirebaseData("prev_inventory", currentInventory),
       updateFirebaseData("investment_record", newInvestmentRecord),
     ]);
   } catch (error) {
-    await sendTelegramAlert(`⛔ Error crítico en el proceso principal`, error);
+    console.error("Error en checkInventoryChanges:", error);
+    await sendTelegramMessage(
+      `🚨 Error en checkInventoryChanges: ${error.message}`
+    );
     throw error;
   }
 }
 
-// ======================
-// Inicialización y ejecución
-// ======================
+// =======================
+// Ejecución principal
+// =======================
 (async () => {
   try {
-    validateEnvironment();
-    initializeApp(FIREBASE_CONFIG);
-    console.log("🔥 Firebase inicializado correctamente");
-
     await checkInventoryChanges();
-    await sendTelegramAlert("🟢 Ejecución completada exitosamente");
+    console.log("Ejecución completada exitosamente");
   } catch (error) {
-    console.error("Error durante la ejecución:", error);
+    console.error("Error en la ejecución principal:", error);
+    await sendTelegramMessage(`🚨 Error crítico: ${error.message}`);
     process.exit(1);
   }
 })();
 
-// ======================
-// Manejo de errores globales
-// ======================
+// =======================
+// Manejo global de errores
+// =======================
 process.on("uncaughtException", async (error) => {
-  await sendTelegramAlert("💥 Excepción no capturada", error);
+  console.error("uncaughtException:", error);
+  await sendTelegramMessage(`💥 Error no capturado: ${error.message}`);
   process.exit(1);
 });
 
 process.on("unhandledRejection", async (reason, promise) => {
-  await sendTelegramAlert("⚠️ Promesa no manejada", reason);
+  console.error("unhandledRejection:", reason);
+  await sendTelegramMessage(`⚠️ Promesa rechazada: ${reason}`);
   process.exit(1);
 });
