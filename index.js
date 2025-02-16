@@ -177,59 +177,73 @@ async function checkInventoryChanges() {
     let hasChanges = false;
     const newInvestmentRecord = { ...investmentRecord };
 
-    // Procesar cambios: inversiones y ventas
+    // Listas para almacenar detalles de las transacciones
+    let investmentTransactions = [];
+    let saleTransactions = [];
+
+    // Procesar cada ítem presente en el inventario actual
     for (const [itemName, currentCount] of Object.entries(currentInventory)) {
       const prevCount = prevInventory[itemName] || 0;
       const diff = currentCount - prevCount;
 
       if (diff > 0) {
-        newInvestmentRecord[itemName] =
-          (newInvestmentRecord[itemName] || 0) + diff;
+        // Se detecta inversión (compra o acumulación)
+        investmentTransactions.push({ item: itemName, quantity: diff });
+        newInvestmentRecord[itemName] = (newInvestmentRecord[itemName] || 0) + diff;
         hasChanges = true;
       } else if (diff < 0) {
+        // Se detecta venta (o disminución)
         const invested = newInvestmentRecord[itemName] || 0;
-        const sold = Math.min(Math.abs(diff), invested);
-        if (sold > 0) {
-          newInvestmentRecord[itemName] -= sold;
+        const saleAmount = Math.min(Math.abs(diff), invested);
+        if (saleAmount > 0) {
+          saleTransactions.push({ item: itemName, quantity: saleAmount });
+          newInvestmentRecord[itemName] = (newInvestmentRecord[itemName] || 0) - saleAmount;
           hasChanges = true;
         }
       }
     }
 
-    // Eliminar items que ya no existen
-    for (const itemName in newInvestmentRecord) {
-      if (
-        !(itemName in currentInventory) &&
-        newInvestmentRecord[itemName] > 0
-      ) {
-        delete newInvestmentRecord[itemName];
-        hasChanges = true;
+    // Procesar ítems que estaban en el inventario previo pero ya no aparecen en el actual
+    for (const itemName in prevInventory) {
+      if (!(itemName in currentInventory)) {
+        const remaining = newInvestmentRecord[itemName] || 0;
+        if (remaining > 0) {
+          saleTransactions.push({ item: itemName, quantity: remaining });
+          delete newInvestmentRecord[itemName];
+          hasChanges = true;
+        }
       }
     }
 
+    // Enviar mensaje detallado si se detectaron cambios
     if (hasChanges) {
       let message = `📊 Actualización de ${PLAYER_NAME}:\n`;
-      const changes = Object.entries(currentInventory)
-        .filter(([name, count]) => (prevInventory[name] || 0) !== count)
-        .map(
-          ([name, count]) => `${name}: ${prevInventory[name] || 0} → ${count}`
-        );
-      if (changes.length > 0) {
-        message += "\n🔔 Cambios:\n" + changes.join("\n");
+
+      if (investmentTransactions.length > 0) {
+        const investmentsStr = investmentTransactions
+          .map(t => `${t.item}: +${t.quantity}`)
+          .join("\n");
+        message += "\n💰 Inversiones:\n" + investmentsStr;
       }
+
+      if (saleTransactions.length > 0) {
+        const salesStr = saleTransactions
+          .map(t => `${t.item}: -${t.quantity}`)
+          .join("\n");
+        message += "\n\n🛒 Ventas:\n" + salesStr;
+      }
+
       await sendTelegramMessage(message);
     }
 
-    // Actualizar datos en Firebase
+    // Actualizar registros en Firebase
     await Promise.all([
       updateFirebaseData("prev_inventory", currentInventory),
       updateFirebaseData("investment_record", newInvestmentRecord),
     ]);
   } catch (error) {
     console.error("Error en checkInventoryChanges:", error);
-    await sendTelegramMessage(
-      `🚨 Error en checkInventoryChanges: ${error.message}`
-    );
+    await sendTelegramMessage(`🚨 Error en checkInventoryChanges: ${error.message}`);
     throw error;
   }
 }
